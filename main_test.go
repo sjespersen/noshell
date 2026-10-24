@@ -2,11 +2,21 @@ package main
 
 import (
 	"bufio"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"io/fs"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -143,6 +153,9 @@ func TestOptionsStarRejected(t *testing.T) {
 }
 
 func TestProbeURL(t *testing.T) {
+	if got, _ := probeURL(":8443", true); got != "https://127.0.0.1:8443/" {
+		t.Errorf("https: got %q", got)
+	}
 	cases := map[string]string{
 		":8080":        "http://127.0.0.1:8080/",
 		"0.0.0.0:9000": "http://127.0.0.1:9000/",
@@ -152,12 +165,12 @@ func TestProbeURL(t *testing.T) {
 		"10.0.0.5:80":  "http://10.0.0.5:80/",
 	}
 	for in, want := range cases {
-		got, err := probeURL(in)
+		got, err := probeURL(in, false)
 		if err != nil || got != want {
 			t.Errorf("%s: got %q %v, want %q", in, got, err, want)
 		}
 	}
-	if _, err := probeURL("8080"); err == nil {
+	if _, err := probeURL("8080", false); err == nil {
 		t.Error("expected error for address without colon")
 	}
 }
@@ -165,17 +178,17 @@ func TestProbeURL(t *testing.T) {
 func TestHealthcheck(t *testing.T) {
 	ok := httptest.NewServer(handler(t))
 	defer ok.Close()
-	if code := healthcheck(ok.Listener.Addr().String()); code != 0 {
+	if code := healthcheck(ok.Listener.Addr().String(), false); code != 0 {
 		t.Errorf("healthy server: got %d", code)
 	}
 	foreign := httptest.NewServer(http.NotFoundHandler())
 	defer foreign.Close()
-	if code := healthcheck(foreign.Listener.Addr().String()); code != 1 {
+	if code := healthcheck(foreign.Listener.Addr().String(), false); code != 1 {
 		t.Errorf("foreign 404 server: got %d, want 1", code)
 	}
 	addr := foreign.Listener.Addr().String()
 	foreign.Close()
-	if code := healthcheck(addr); code != 1 {
+	if code := healthcheck(addr, false); code != 1 {
 		t.Errorf("nothing listening: got %d, want 1", code)
 	}
 }
@@ -212,5 +225,134 @@ func TestLimitListener(t *testing.T) {
 	case <-accepted:
 	case <-time.After(2 * time.Second):
 		t.Fatal("slot not released after close")
+	}
+}
+
+// writeCert writes a fresh self-signed certificate for cn into dir.
+func writeCert(t *testing.T, dir, cn string) (certFile, keyFile string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: cn},
+		DNSNames:     []string{cn},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kder, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certFile, keyFile = filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: kder}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return certFile, keyFile
+}
+
+func startTLS(t *testing.T) (addr string, certs *certReloader) {
+	t.Helper()
+	certs, err := newCertReloader(writeCert(t, t.TempDir(), "example.test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newServer("", handler(t))
+	srv.TLSConfig = tlsConfig(certs)
+	ln, err := listen("127.0.0.1:0", 4, srv.TLSConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return ln.Addr().String(), certs
+}
+
+func TestTLS(t *testing.T) {
+	addr, _ := startTLS(t)
+	c := http.Client{Transport: &http.Transport{
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2", "http/1.1"}},
+		ForceAttemptHTTP2: true,
+	}}
+	resp, err := c.Get("https://" + addr + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d", resp.StatusCode)
+	}
+	if resp.ProtoMajor != 1 {
+		t.Errorf("negotiated %s, want HTTP/1.1 only", resp.Proto)
+	}
+	if !strings.HasPrefix(resp.Header.Get("Strict-Transport-Security"), "max-age=") {
+		t.Error("missing HSTS over TLS")
+	}
+
+	_, err = tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, MaxVersion: tls.VersionTLS11})
+	if err == nil {
+		t.Error("TLS 1.1 handshake succeeded")
+	}
+
+	if code := healthcheck(addr, true); code != 0 {
+		t.Errorf("TLS healthcheck: got %d", code)
+	}
+}
+
+func TestNoHSTSOverPlainHTTP(t *testing.T) {
+	if rr := do(t, httptest.NewRequest(http.MethodGet, "/", nil)); rr.Header().Get("Strict-Transport-Security") != "" {
+		t.Error("HSTS sent over plain HTTP")
+	}
+}
+
+func TestCertReload(t *testing.T) {
+	dir := t.TempDir()
+	certs, err := newCertReloader(writeCert(t, dir, "old.test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cn := func() string {
+		t.Helper()
+		c, err := certs.GetCertificate(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leaf, err := x509.ParseCertificate(c.Certificate[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return leaf.Subject.CommonName
+	}
+	future := time.Now().Add(time.Hour)
+
+	// A broken renewal keeps serving the old certificate.
+	if err := os.WriteFile(filepath.Join(dir, "cert.pem"), []byte("garbage"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(filepath.Join(dir, "cert.pem"), future, future)
+	certs.checked = time.Time{}
+	if got := cn(); got != "old.test" {
+		t.Fatalf("after bad renewal: got %q", got)
+	}
+
+	// Within the check interval nothing is re-read.
+	writeCert(t, dir, "new.test")
+	_ = os.Chtimes(filepath.Join(dir, "cert.pem"), future.Add(time.Minute), future.Add(time.Minute))
+	if got := cn(); got != "old.test" {
+		t.Fatalf("reloaded before interval: got %q", got)
+	}
+
+	certs.checked = time.Time{}
+	if got := cn(); got != "new.test" {
+		t.Fatalf("after renewal: got %q", got)
 	}
 }

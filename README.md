@@ -28,6 +28,34 @@ stray `.env`, `.DS_Store` or `_drafts/` stays private.
 | `ADDR` / `-addr` | `:8080` | Listen address. The healthcheck reads the same value. |
 | `MAX_CONNS` / `-max-conns` | `1024` | Concurrent connection cap. |
 | `QUIET` / `-quiet` | off | Disable the access log (one line per request on stderr). |
+| `TLS_CERT` / `-tls-cert` | unset | PEM certificate chain. Setting it and `TLS_KEY` switches the listener to HTTPS. |
+| `TLS_KEY` / `-tls-key` | unset | PEM private key. |
+
+### HTTPS
+
+Mount a certificate and key read-only and point the env vars at them:
+
+```
+docker run --rm -p 443:8080 --read-only --cap-drop=ALL \
+  --security-opt=no-new-privileges --ulimit nofile=4096 \
+  -v /etc/noshell/tls:/tls:ro \
+  -e TLS_CERT=/tls/fullchain.pem -e TLS_KEY=/tls/privkey.pem noshell
+```
+
+- The files must be readable by UID 65532 inside the container.
+- The container still listens on `:8080` (it can't bind 443 without
+  capabilities); map the host port with `-p 443:8080`.
+- TLS 1.2+ with Go's default cipher suites, HTTP/1.1 only (no HTTP/2).
+- Renewed files (certbot, cert-manager, a Kubernetes secret) are picked up
+  within a minute without a restart. A broken or half-written renewal is
+  logged and the previous certificate keeps being served.
+- Over HTTPS every response carries `Strict-Transport-Security: max-age=31536000`
+  (no `includeSubDomains`/`preload`; add those at a proxy if you want them).
+- There's no ACME client and no port-80 redirect: getting certificates needs
+  outbound network, CA roots and a writable cache, which this image avoids.
+  Issue them outside (certbot, cert-manager, `lego`) and mount them.
+- The healthcheck probes `https://127.0.0.1` without verifying the
+  certificate; it only checks liveness on loopback.
 
 ## What it does and doesn't do
 
@@ -37,6 +65,7 @@ stray `.env`, `.DS_Store` or `_drafts/` stays private.
   check is defense in depth.
 - Single byte-range requests only (multi-range would amplify traffic)
 - No directory listings, no compression, no CGI, no proxying, HTTP/1.1 only
+  (also over TLS)
 - Timeouts, ~16 KiB header limit, connection cap, graceful shutdown on SIGTERM
 - Security headers (CSP, nosniff, frame-deny, referrer, COOP, permissions)
 - Runs as UID 65532; `-healthcheck` replaces curl for Docker's HEALTHCHECK and
@@ -55,8 +84,10 @@ specific origins or hashes rather than `'unsafe-inline'`.
   container still shares the host kernel. What's gone is everything an attacker
   normally uses *after* a bug: no shell to spawn, no tools to download with,
   nothing to write to.
-- No TLS. Put a proxy in front (Caddy, Traefik, a cloud LB) and set HSTS
-  there. Keep that proxy patched — Envoy/Istio were in the Brotli advisory.
+- TLS adds Go's `crypto/tls` handshake parser to what's exposed. If you
+  already run a proxy (Caddy, Traefik, a cloud LB), terminating TLS there and
+  leaving noshell on plain HTTP is just as good. Keep that proxy patched —
+  Envoy/Istio were in the Brotli advisory.
 - The image only stays secure if it's rebuilt when Go ships security releases.
   CI rebuilds and rescans weekly; redeploy the new image.
 - `--read-only` and `--cap-drop=ALL` must be passed at run time; the image
