@@ -89,7 +89,7 @@ specific origins or hashes rather than `'unsafe-inline'`.
   leaving noshell on plain HTTP is just as good. Keep that proxy patched —
   Envoy/Istio were in the Brotli advisory.
 - The image only stays secure if it's rebuilt when Go ships security releases.
-  CI rebuilds and rescans weekly; redeploy the new image.
+  Bump the Go version, rebuild and redeploy.
 - `--read-only` and `--cap-drop=ALL` must be passed at run time; the image
   can't enforce them.
 - For a stronger boundary than Docker, run it under gVisor (`--runtime=runsc`)
@@ -97,18 +97,13 @@ specific origins or hashes rather than `'unsafe-inline'`.
 
 ## Supply chain
 
-- Go version pinned in one place (`toolchain` in `go.mod`, mirrored in the
-  Dockerfile; CI fails if they drift).
-- CI actions pinned to commit SHAs; Dependabot updates actions, the base
-  image and Go modules weekly.
-- `govulncheck` runs on the source and on the built binary.
-- Images are multi-arch (amd64/arm64), carry SBOM and provenance
-  attestations, and are signed with cosign (keyless). Verify with:
+- Go version pinned in one place: `toolchain` in `go.mod`, mirrored in the
+  Dockerfile. Keep them in sync.
+- No third-party Go modules; the binary is the standard library plus this code.
+- Check for known vulnerabilities before shipping:
 
   ```
-  cosign verify ghcr.io/OWNER/noshell:latest \
-    --certificate-identity-regexp 'https://github.com/OWNER/noshell/' \
-    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
   ```
 
 ### Pinning the build image
@@ -117,7 +112,7 @@ Pin `golang:<version>-alpine` by digest so a moved tag can't change what builds
 the binary. Get the digest with
 `docker buildx imagetools inspect golang:1.27.3-alpine --format '{{.Manifest.Digest}}'`
 and change the `FROM` line to `golang:${GO_VERSION}-alpine@sha256:…`.
-Dependabot keeps it updated afterwards.
+Update the digest when you bump the Go version.
 
 ## Development
 

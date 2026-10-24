@@ -1,9 +1,9 @@
-# Must match the toolchain line in go.mod (CI checks this).
+# Must match the toolchain line in go.mod.
 ARG GO_VERSION=1.27.3
 
 # ---- build stage (has a shell; never shipped) ----
-# Pin by digest too, e.g. golang:1.27.3-alpine@sha256:<digest>; Dependabot
-# keeps a pinned digest up to date. See README "Pinning the build image".
+# Pin by digest too, e.g. golang:1.27.3-alpine@sha256:<digest>.
+# See README "Pinning the build image".
 FROM golang:${GO_VERSION}-alpine AS build
 WORKDIR /src
 ENV CGO_ENABLED=0 GOOS=linux GOFLAGS=-mod=readonly GOTOOLCHAIN=local
